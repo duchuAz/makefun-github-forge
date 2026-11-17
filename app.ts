@@ -28,14 +28,14 @@ function headerPairs(headers: Readonly<Record<string, string>>): string[] {
 
 /** Answer one request with a JSON body; `headers` go beside the JSON ones. */
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const bytes = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, [
     'content-type', JSON_TYPE,
-    'content-length', String(Buffer.byteLength(text)),
+    'content-length', String(bytes.length),
     'x-github-request-id', `req-${requestIdCounter++}`,
     ...headerPairs(headers),
   ]);
-  res.end(text);
+  res.end(bytes);
 }
 
 /** Answer with already-serialized JSON bytes (the cached issue body); framing matches sendJson. */
@@ -784,6 +784,10 @@ function handleMcp(res: ServerResponse, raw: string, parsed: unknown): void {
 
 // ---------------------------------------------------------------- the server
 
+// Any write (except the read-only upload-pack commands) invalidates the socket layer's reply cache,
+// so a GET/ls-refs/fetch never sees a response from before the write.
+let resourceVersion = 0;
+
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   // The workload is a burst of small keep-alive requests: a direct socket server, no per-request
@@ -791,6 +795,7 @@ export function createApp(): Server {
   return serve((rawReq: RawRequest, rawRes: RawResponse) => {
     const req = rawReq as unknown as IncomingMessage;
     const res = rawRes as unknown as ServerResponse;
+    if (req.method !== 'GET' && req.method !== 'HEAD' && !(req.url ?? '').endsWith('/git-upload-pack')) resourceVersion += 1;
     void handleRequest(req, res).catch((err: unknown) => {
       try {
         const status = err instanceof ApiError ? err.status : 500;
@@ -799,7 +804,7 @@ export function createApp(): Server {
         res.destroy();
       }
     });
-  });
+  }, { version: () => resourceVersion });
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {

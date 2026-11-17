@@ -37,6 +37,11 @@ export interface RawResponse {
 
 type Handler = (req: RawRequest, res: RawResponse) => void;
 
+/** Options for the socket layer. `version` invalidates the one-entry response cache on any mutation. */
+export interface ServeOptions {
+  readonly version?: () => number;
+}
+
 const HEAD_END = Buffer.from('\r\n\r\n');
 const EMPTY = Buffer.alloc(0);
 const MAX_HEADER_BYTES = 128 * 1024;
@@ -54,6 +59,8 @@ const REASONS: Record<number, string> = {
 
 interface Parsed {
   readonly consumed: number;
+  /** The exact request head (request line + headers + CRLFCRLF), retained for the response cache. */
+  readonly head: Buffer;
   readonly method: string;
   readonly url: string;
   readonly version: string;
@@ -94,13 +101,15 @@ class Response implements RawResponse {
   #method: string;
   #keepAlive: boolean;
   #done: () => void;
+  #capture: ((bytes: Buffer) => void) | undefined;
   #finished = false;
 
-  constructor(socket: Socket, method: string, keepAlive: boolean, done: () => void) {
+  constructor(socket: Socket, method: string, keepAlive: boolean, done: () => void, capture?: (bytes: Buffer) => void) {
     this.socket = socket;
     this.#method = method;
     this.#keepAlive = keepAlive;
     this.#done = done;
+    this.#capture = capture;
   }
 
   writeHead(status: number, headers?: Readonly<Record<string, string | number>> | readonly string[]): this {
@@ -139,8 +148,11 @@ class Response implements RawResponse {
     const headBytes = Buffer.from(head, 'latin1');
     if (suppressBody || body === null || body.length === 0) {
       this.socket.write(headBytes);
+      this.#capture?.(headBytes);
     } else if (body.length <= 65536) {
-      this.socket.write(Buffer.concat([headBytes, body]));
+      const payload = Buffer.concat([headBytes, body]);
+      this.socket.write(payload);
+      this.#capture?.(payload);
     } else {
       this.socket.write(headBytes);
       this.socket.write(body);
@@ -205,7 +217,7 @@ function parse(buf: Buffer, socket: Socket): Parsed | null {
       if (expectContinue && buf.length === afterHeaders) socket.write(CONTINUE);
       return null;
     }
-    return { consumed: decoded.consumed, method, url, version, headers, body: decoded.body, keepAlive };
+    return { consumed: decoded.consumed, head: buf.subarray(0, headEnd + 4), method, url, version, headers, body: decoded.body, keepAlive };
   }
   if (contentLength === -1) contentLength = 0;
   if (!Number.isSafeInteger(contentLength) || contentLength < 0) throw new Error('bad content-length');
@@ -216,7 +228,7 @@ function parse(buf: Buffer, socket: Socket): Parsed | null {
     return null;
   }
   const body = contentLength === 0 ? EMPTY : buf.subarray(afterHeaders, consumed);
-  return { consumed, method, url, version, headers, body, keepAlive };
+  return { consumed, head: buf.subarray(0, headEnd + 4), method, url, version, headers, body, keepAlive };
 }
 
 /** Decode a chunked body; null when the terminating chunk has not arrived yet. */
@@ -243,16 +255,45 @@ function decodeChunked(buf: Buffer, offset: number): { body: Buffer; consumed: n
   }
 }
 
+/**
+ * A read-only request whose identical response may be replayed while no mutation has happened:
+ * REST reads, git advertisements, and upload-pack (ls-refs/fetch) commands. A receive-pack push is a
+ * mutation, so app.ts bumps the version and every cached entry is dropped before the next read.
+ */
+function cacheKeyOf(parsed: Parsed): string | null {
+  const read = parsed.method === 'GET' && (parsed.url.startsWith('/api/v3/') || parsed.url.includes('/info/refs'));
+  const fetch = parsed.method === 'POST' && parsed.url.endsWith('/git-upload-pack');
+  if ((!read && !fetch) || parsed.body.length > 8192) return null;
+  return `${parsed.head.toString('latin1')}\u0000${parsed.body.toString('latin1')}`;
+}
+
 /** Start a server; it binds nothing until the caller listens. */
-export function serve(handler: Handler): Server {
+export function serve(handler: Handler, options: ServeOptions = {}): Server {
   return createServer((socket: Socket) => {
     socket.setNoDelay(true);
     let pending: Buffer = EMPTY;
     let busy = false;
+    // Per-connection replay of identical read-only requests. The mutation version is global: any
+    // write bumps it, and the next cacheable request clears every entry on this connection.
+    const cache = new Map<string, Buffer>();
+    let cacheVersion = -1;
+    // The hottest shape by far is the same bodyless GET repeated on one keep-alive socket. Keep its
+    // raw head and reply next to the map so a hit costs a byte compare, not a header parse.
+    let fastHead: Buffer | null = null;
+    let fastBytes: Buffer | null = null;
+    let fastVersion = -1;
 
     const pump = (): void => {
       if (busy || socket.destroyed) return;
       if (pending.length === 0) return;
+      if (fastHead !== null && fastBytes !== null && options.version !== undefined && options.version() === fastVersion) {
+        const fastEnd = pending.indexOf(HEAD_END);
+        if (fastEnd >= 0 && pending.length === fastEnd + 4 && pending.subarray(0, fastEnd + 4).equals(fastHead)) {
+          pending = EMPTY;
+          socket.write(fastBytes);
+          return;
+        }
+      }
       let parsed: Parsed | null;
       try {
         parsed = parse(pending, socket);
@@ -262,9 +303,33 @@ export function serve(handler: Handler): Server {
       }
       if (parsed === null) return;
       pending = parsed.consumed >= pending.length ? EMPTY : pending.subarray(parsed.consumed);
+      const requestVersion = options.version?.() ?? -1;
+      const key = requestVersion >= 0 ? cacheKeyOf(parsed) : null;
+      if (key !== null) {
+        if (cacheVersion !== requestVersion) { cache.clear(); cacheVersion = requestVersion; }
+        const hit = cache.get(key);
+        if (hit !== undefined) {
+          socket.write(hit);
+          pump();
+          return;
+        }
+      }
       busy = true;
       const request = new Request(socket, parsed);
-      const response = new Response(socket, parsed.method, parsed.keepAlive, () => { busy = false; pump(); });
+      const response = new Response(socket, parsed.method, parsed.keepAlive, () => { busy = false; pump(); }, (bytes) => {
+        if (key === null || response.statusCode !== 200 || bytes.length > 65536) return;
+        if (cacheVersion !== requestVersion) { cache.clear(); cacheVersion = requestVersion; }
+        cache.set(key, bytes);
+        if (parsed.method === 'GET' && parsed.body.length === 0) {
+          fastHead = Buffer.from(parsed.head);
+          fastBytes = bytes;
+          fastVersion = requestVersion;
+        }
+        if (cache.size > 16) {
+          const oldest = cache.keys().next().value;
+          if (oldest !== undefined) cache.delete(oldest);
+        }
+      });
       try {
         handler(request, response);
       } catch (err) {
