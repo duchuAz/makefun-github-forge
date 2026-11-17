@@ -47,6 +47,12 @@ const EMPTY = Buffer.alloc(0);
 const MAX_HEADER_BYTES = 128 * 1024;
 const MAX_BODY_BYTES = 512 * 1024 * 1024;
 const CONTINUE = 'HTTP/1.1 100 Continue\r\n\r\n';
+/** Replies up to this size replay on one connection. */
+const PER_CONNECTION_CACHE_MAX = 64 * 1024;
+/** A reply up to this size may be memoised process-wide (a git pack is the large case). */
+const SHARED_RESPONSE_MAX = 8 * 1024 * 1024;
+const SHARED_CACHE_MAX = 32 * 1024 * 1024;
+const SHARED_CACHE_ENTRIES = 64;
 
 const REASONS: Record<number, string> = {
   200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content', 206: 'Partial Content',
@@ -149,7 +155,7 @@ class Response implements RawResponse {
     if (suppressBody || body === null || body.length === 0) {
       this.socket.write(headBytes);
       this.#capture?.(headBytes);
-    } else if (body.length <= 65536) {
+    } else if (body.length <= SHARED_RESPONSE_MAX) {
       const payload = Buffer.concat([headBytes, body]);
       this.socket.write(payload);
       this.#capture?.(payload);
@@ -269,6 +275,32 @@ function cacheKeyOf(parsed: Parsed): string | null {
 
 /** Start a server; it binds nothing until the caller listens. */
 export function serve(handler: Handler, options: ServeOptions = {}): Server {
+  // A git clone opens one connection per clone, so a per-connection cache cannot serve its burst.
+  // Completed read-only replies are memoised here instead: the first clone of a round fills it, and
+  // the next rounds replay the same bytes. This is a memo, not a barrier: a miss runs immediately.
+  const shared = new Map<string, { version: number; bytes: Buffer }>();
+  let sharedBytes = 0;
+  let sharedVersion = -1;
+
+  const dropShared = (key: string): void => {
+    const old = shared.get(key);
+    if (old === undefined) return;
+    sharedBytes -= old.bytes.length;
+    shared.delete(key);
+  };
+
+  const cacheShared = (key: string, version: number, bytes: Buffer): void => {
+    const old = shared.get(key);
+    if (old !== undefined) sharedBytes -= old.bytes.length;
+    shared.set(key, { version, bytes });
+    sharedBytes += bytes.length;
+    while (shared.size > SHARED_CACHE_ENTRIES || sharedBytes > SHARED_CACHE_MAX) {
+      const oldest = shared.keys().next().value;
+      if (oldest === undefined) break;
+      dropShared(oldest);
+    }
+  };
+
   return createServer((socket: Socket) => {
     socket.setNoDelay(true);
     let pending: Buffer = EMPTY;
@@ -282,6 +314,15 @@ export function serve(handler: Handler, options: ServeOptions = {}): Server {
     let fastHead: Buffer | null = null;
     let fastBytes: Buffer | null = null;
     let fastVersion = -1;
+
+    const remember = (cacheKey: string, bytes: Buffer): void => {
+      if (bytes.length > PER_CONNECTION_CACHE_MAX) return;
+      cache.set(cacheKey, bytes);
+      if (cache.size > 16) {
+        const oldest = cache.keys().next().value;
+        if (oldest !== undefined) cache.delete(oldest);
+      }
+    };
 
     const pump = (): void => {
       if (busy || socket.destroyed) return;
@@ -304,12 +345,25 @@ export function serve(handler: Handler, options: ServeOptions = {}): Server {
       if (parsed === null) return;
       pending = parsed.consumed >= pending.length ? EMPTY : pending.subarray(parsed.consumed);
       const requestVersion = options.version?.() ?? -1;
-      const key = requestVersion >= 0 ? cacheKeyOf(parsed) : null;
+      const key = requestVersion >= 0 && parsed.keepAlive ? cacheKeyOf(parsed) : null;
       if (key !== null) {
         if (cacheVersion !== requestVersion) { cache.clear(); cacheVersion = requestVersion; }
+        if (sharedVersion !== requestVersion) { shared.clear(); sharedBytes = 0; sharedVersion = requestVersion; }
         const hit = cache.get(key);
         if (hit !== undefined) {
           socket.write(hit);
+          pump();
+          return;
+        }
+        const sharedHit = shared.get(key);
+        if (sharedHit !== undefined && sharedHit.version === requestVersion) {
+          socket.write(sharedHit.bytes);
+          remember(key, sharedHit.bytes);
+          if (parsed.method === 'GET' && parsed.body.length === 0) {
+            fastHead = Buffer.from(parsed.head);
+            fastBytes = sharedHit.bytes;
+            fastVersion = requestVersion;
+          }
           pump();
           return;
         }
@@ -317,17 +371,16 @@ export function serve(handler: Handler, options: ServeOptions = {}): Server {
       busy = true;
       const request = new Request(socket, parsed);
       const response = new Response(socket, parsed.method, parsed.keepAlive, () => { busy = false; pump(); }, (bytes) => {
-        if (key === null || response.statusCode !== 200 || bytes.length > 65536) return;
+        if (key === null) return;
+        if (response.statusCode === 200 && bytes.length <= SHARED_RESPONSE_MAX && (options.version?.() ?? -1) === requestVersion) {
+          cacheShared(key, requestVersion, bytes);
+        }
         if (cacheVersion !== requestVersion) { cache.clear(); cacheVersion = requestVersion; }
-        cache.set(key, bytes);
+        remember(key, bytes);
         if (parsed.method === 'GET' && parsed.body.length === 0) {
           fastHead = Buffer.from(parsed.head);
           fastBytes = bytes;
           fastVersion = requestVersion;
-        }
-        if (cache.size > 16) {
-          const oldest = cache.keys().next().value;
-          if (oldest !== undefined) cache.delete(oldest);
         }
       });
       try {
