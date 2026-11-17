@@ -664,7 +664,9 @@ function pullFiles(forge: Forge, repo: Repo, pull: Pull): Array<{ path: string; 
   const base = repo.refs.get(`refs/heads/${pull.baseRef}`);
   if (head === undefined) return [];
   const mergeBase = forge.mergeBase(repo, base ?? head, head);
-  return forge.diffTrees(repo, treeOf(forge, repo, mergeBase), treeOf(forge, repo, head));
+  return forge
+    .diffTrees(repo, treeOf(forge, repo, mergeBase), treeOf(forge, repo, head))
+    .map((file) => ({ path: file.filename, additions: file.additions, deletions: file.deletions }));
 }
 
 interface GqlError {
@@ -1045,9 +1047,10 @@ function resolveTypedField(context: ExecContext, resolved: Resolved, field: Fiel
     return null;
   }
   if (typeName === 'IssueComment') {
-    const comment = value as IssueComment;
+    const holder = value as { comment?: IssueComment };
+    const comment = (holder.comment ?? holder) as IssueComment;
     switch (field.name) {
-      case 'id': return comment.id;
+      case 'id': return String(comment.id);
       case 'body': return comment.body;
       case 'createdAt': return comment.createdAt;
       case 'author': return resolveValue(context, object2('User', context.forge.viewer), field.selections ?? [], errors);

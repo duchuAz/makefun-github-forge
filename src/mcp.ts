@@ -236,7 +236,10 @@ function runTool(forge: Forge, name: string, args: Record<string, unknown>): unk
       const base = String(args.base ?? '');
       const title = String(args.title ?? '');
       const pull = forge.openPull(repo, title, typeof args.body === 'string' ? args.body : '', head, base);
-      return pullJson(repo, pull);
+      return pullJson(repo, pull, {
+        headSha: repo.refs.get(`refs/heads/${pull.headRef}`) ?? '',
+        baseSha: repo.refs.get(`refs/heads/${pull.baseRef}`) ?? '',
+      });
     }
     case 'merge_pull_request': {
       const repo = repoOf(forge, args);

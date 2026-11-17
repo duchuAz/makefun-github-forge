@@ -125,7 +125,7 @@ function commitJson(repo: Repo, sha: string): Record<string, unknown> {
     html_url: `https://forge.invalid/${repo.owner}/${repo.name}/commit/${sha}`,
     url: `${repoUrl(repo)}/commits/${sha}`,
     commit: {
-      message: view?.message ?? '',
+      message: (view?.message ?? '').replace(/\n+$/, ''),
       author: { ...author, date: author.date },
       committer: { ...committer, date: committer.date },
       tree: { sha: view?.tree ?? '', url: `${repoUrl(repo)}/git/trees/${view?.tree ?? ''}` },
@@ -297,7 +297,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, method: string, p
           return sendJson(res, 200, { name: branchName, commit: { sha, commit: commitJson(repo, sha), url: `${repoUrl(repo)}/commits/${sha}` }, protected: false });
         }
       }
-      if (head === 'git' && segments[1] === 'refs' && method === 'POST' && segments.length === 3) {
+      if (head === 'git' && segments[1] === 'refs' && method === 'POST' && segments.length <= 3) {
         const input = parseJsonBody(body);
         const ref = typeof input.ref === 'string' ? input.ref : '';
         const sha = typeof input.sha === 'string' ? input.sha : '';
@@ -621,7 +621,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
     if (route.service === 'git-upload-pack') {
       if (wantsV2) {
         const packets = decodePktLines(body);
-        const args = new Map<string, string>();
+        const args = new Map<string, string[]>();
         let command = '';
         let inCommandSection = true;
         for (const packet of packets) {
@@ -640,8 +640,11 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
             if (inCommandSection && text.startsWith('agent=')) continue;
             inCommandSection = false;
             const space = text.indexOf(' ');
-            if (space < 0) args.set(text, '');
-            else args.set(text.slice(0, space), text.slice(space + 1));
+            const key = space < 0 ? text : text.slice(0, space);
+            const value = space < 0 ? '' : text.slice(space + 1);
+            const list = args.get(key);
+            if (list === undefined) args.set(key, [value]);
+            else list.push(value);
           }
         }
         if (command === 'ls-refs') {
@@ -651,19 +654,13 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
           return;
         }
         if (command === 'fetch') {
-          const wants: string[] = [];
-          const haves: string[] = [];
-          const shallow: string[] = [];
-          let depth: number | null = null;
-          let done = false;
-          for (const [key, value] of args) {
-            if (key === 'want') wants.push(value);
-            else if (key === 'have') haves.push(value);
-            else if (key === 'shallow') shallow.push(value);
-            else if (key === 'deepen') depth = Number(value);
-            else if (key === 'done') done = true;
-            else if (key === 'deepen-since' || key === 'deepen-not') depth = null;
-          }
+          const wants: string[] = args.get('want') ?? [];
+          const haves: string[] = args.get('have') ?? [];
+          const shallow: string[] = args.get('shallow') ?? [];
+          const deepen = args.get('deepen');
+          let depth: number | null = deepen === undefined ? null : Number(deepen[deepen.length - 1]);
+          const done = args.has('done');
+          if (args.has('deepen-since') || args.has('deepen-not')) depth = null;
           if (wants.length === 0) {
             const reply = Buffer.concat([pkt('packfile\n'), FLUSH]);
             res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache', 'content-length': reply.length });

@@ -7,14 +7,16 @@ import { createHash } from 'node:crypto';
 import { Forge, type Repo, type GitObjectType, hashObject, parseCommit, parseTree } from './store.ts';
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
-const MAX_PAYLOAD = 65520;
+/** A pkt-line's on-the-wire length (the 4-byte prefix + payload) tops out at 65520. */
+const MAX_TOTAL = 65520;
+const MAX_PAYLOAD = MAX_TOTAL - 4;
 
 // ---------------------------------------------------------------- pkt-line codec
 
 /** Encode one pkt-line: a 4-byte hex length prefix (payload + 4) then the payload. */
 export function pkt(payload: string | Uint8Array): Buffer {
   const bytes = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : Buffer.from(payload);
-  if (bytes.length + 4 > MAX_PAYLOAD + 4) throw new Error(`pkt-line payload of ${bytes.length} bytes is too long`);
+  if (bytes.length > MAX_PAYLOAD) throw new Error(`pkt-line payload of ${bytes.length} bytes is too long`);
   return Buffer.concat([Buffer.from((bytes.length + 4).toString(16).padStart(4, '0'), 'ascii'), bytes]);
 }
 
@@ -47,7 +49,7 @@ export function decodePktLines(input: Uint8Array): PktLine[] {
       offset += 4;
       continue;
     }
-    if (length < 4 || length > MAX_PAYLOAD + 4) throw new Error(`pkt-line length ${length} is out of range`);
+    if (length < 4 || length > MAX_TOTAL) throw new Error(`pkt-line length ${length} is out of range`);
     if (view.length - offset < length) throw new Error('truncated pkt-line payload');
     packets.push({ kind: 'data', payload: view.subarray(offset + 4, offset + length) });
     offset += length;
@@ -63,7 +65,7 @@ function sideband(band: number, chunk: Uint8Array): Buffer {
   return pkt(body);
 }
 
-/** Split a byte stream into sideband band-1 chunks. */
+/** Split a byte stream into sideband band-1 chunks (band byte + payload fits one pkt-line). */
 function sidebandStream(data: Uint8Array): Buffer {
   const source = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   const parts: Buffer[] = [];
@@ -74,32 +76,26 @@ function sidebandStream(data: Uint8Array): Buffer {
   return Buffer.concat(parts);
 }
 
-// ---------------------------------------------------------------- zlib stream length (bisection)
+// ---------------------------------------------------------------- zlib stream boundary
+
+interface Inflated {
+  data: Buffer;
+  consumed: number;
+}
 
 /**
- * The exact byte length of the zlib stream starting at `start`. Node's inflateSync does not report
- * consumed bytes, so bisect on the smallest slice that inflates cleanly: a truncated stream fails
- * (EOF or checksum), a complete one succeeds, and trailing pack bytes after the stream are ignored.
+ * Inflate one zlib stream that starts at `start` and report how many bytes it consumed. With
+ * `{ info: true }` inflateSync exposes the engine's byte count, which stops exactly at the stream's
+ * adler-32 trailer; anything after it (the next entry, the pack trailer) is ignored.
  */
-function zlibStreamLength(view: Buffer, start: number, end: number): number {
-  let low = 2;
-  let high = end - start;
-  if (high <= low) throw new Error('zlib stream cannot fit');
-  const works = (length: number): boolean => {
-    try {
-      inflateSync(view.subarray(start, start + length));
-      return true;
-    } catch {
-      return false;
-    }
+function inflateAt(view: Buffer, start: number): Inflated {
+  const result = inflateSync(view.subarray(start), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
   };
-  if (works(low)) return low;
-  while (high - low > 1) {
-    const mid = Math.floor((low + high) / 2);
-    if (works(mid)) high = mid;
-    else low = mid;
-  }
-  return high;
+  const consumed = result.engine.bytesWritten;
+  if (!consumed || consumed <= 0) throw new Error(`the zlib stream at ${start} consumed no bytes`);
+  return { data: result.buffer, consumed };
 }
 
 // ---------------------------------------------------------------- pack reading
@@ -121,6 +117,7 @@ export interface ReadPackResult {
 
 /** Parse a packfile v2 (objects may be deltas; the caller resolves them). */
 export function readPack(pack: Uint8Array): ReadPackResult {
+  const trace = process.env.DEBUG_PACK === '1';
   const view = Buffer.isBuffer(pack) ? pack : Buffer.from(pack.buffer, pack.byteOffset, pack.byteLength);
   if (view.length < 32) throw new Error('pack is shorter than its header and trailer');
   if (view.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack has no PACK signature');
@@ -136,15 +133,18 @@ export function readPack(pack: Uint8Array): ReadPackResult {
     const first = view[offset] as number;
     const typeBits = (first >> 4) & 7;
     let size = first & 15;
-    let shift = 4;
     let cursor = offset + 1;
-    for (;;) {
-      if (cursor >= objectEnd) throw new Error('pack truncated inside an object header');
-      const byte = view[cursor] as number;
-      cursor += 1;
-      if ((byte & 0x80) === 0) break;
-      size += (byte & 0x7f) << shift;
-      shift += 7;
+    if ((first & 0x80) !== 0) {
+      // the header continues: every size byte contributes 7 bits, the one without the MSB is last
+      let shift = 4;
+      for (;;) {
+        if (cursor >= objectEnd) throw new Error('pack truncated inside an object header');
+        const byte = view[cursor] as number;
+        cursor += 1;
+        size += (byte & 0x7f) << shift;
+        shift += 7;
+        if ((byte & 0x80) === 0) break;
+      }
     }
     if (typeBits === 0 || typeBits === 5) throw new Error(`invalid pack object type ${typeBits}`);
     let type: GitObjectType | 'ofs_delta' | 'ref_delta';
@@ -160,21 +160,26 @@ export function readPack(pack: Uint8Array): ReadPackResult {
         cursor += 1;
       }
       type = 'ofs_delta';
-      entries.push({ type, data: inflateSync(view.subarray(cursor)), offset: entryStart, baseOffset: value });
-      offset = cursor + zlibStreamLength(view, cursor, objectEnd);
+      if (trace) console.error(`[pack] entry ${index} off=${entryStart} OFS_DELTA base=${value} cursor=${cursor} head=${view.subarray(cursor, cursor + 4).toString('hex')}`);
+      const inflated = inflateAt(view, cursor);
+      entries.push({ type, data: inflated.data, offset: entryStart, baseOffset: value });
+      offset = cursor + inflated.consumed;
       continue;
     } else {
       const baseOid = view.subarray(cursor, cursor + 20).toString('hex');
       cursor += 20;
       type = 'ref_delta';
-      entries.push({ type, data: inflateSync(view.subarray(cursor)), offset: entryStart, baseOid });
-      offset = cursor + zlibStreamLength(view, cursor, objectEnd);
+      if (trace) console.error(`[pack] entry ${index} off=${entryStart} REF_DELTA base=${baseOid} cursor=${cursor} head=${view.subarray(cursor, cursor + 4).toString('hex')}`);
+      const inflated = inflateAt(view, cursor);
+      entries.push({ type, data: inflated.data, offset: entryStart, baseOid });
+      offset = cursor + inflated.consumed;
       continue;
     }
-    const data = inflateSync(view.subarray(cursor, objectEnd));
-    if (data.length !== size) throw new Error(`object inflates to ${data.length} bytes, header says ${size}`);
-    entries.push({ type, data, offset: entryStart });
-    offset = cursor + zlibStreamLength(view, cursor, objectEnd);
+    const inflated = inflateAt(view, cursor);
+    if (trace) console.error(`[pack] entry ${index} off=${entryStart} type=${type} size=${size} cursor=${cursor} consumed=${inflated.consumed}`);
+    if (inflated.data.length !== size) throw new Error(`object inflates to ${inflated.data.length} bytes, header says ${size}`);
+    entries.push({ type, data: inflated.data, offset: entryStart });
+    offset = cursor + inflated.consumed;
   }
   const running = createHash('sha1');
   running.update(view.subarray(0, objectEnd));
@@ -241,15 +246,32 @@ export function selectObjects(
 ): Selection {
   const haveSet = new Set(haves.filter((oid) => repo.objects.has(oid)));
   const haveReachable = forge.ancestorCommits(repo, [...haveSet]);
+  // The objects the client already holds: the haves' commits, trees and blobs, so a fetch never
+  // re-sends a tree or blob the new commit shares with the old tip.
+  const held = new Set<string>();
+  const collectHeld = (oid: string): void => {
+    if (held.has(oid)) return;
+    const object = repo.objects.get(oid);
+    if (object === undefined) return;
+    held.add(oid);
+    if (object.type === 'commit') collectHeld(parseCommit(object.data).tree);
+    else if (object.type === 'tree') for (const entry of parseTree(object.data)) collectHeld(entry.oid);
+  };
+  for (const oid of haveSet) collectHeld(oid);
   const clientShallowSet = new Set(clientShallow);
   const walk: Array<{ oid: string; level: number }> = [];
   const seenCommits = new Set<string>();
+  const keptTags = new Set<string>();
   for (const want of wants) {
-    if (!repo.objects.has(want) || haveReachable.has(want) || seenCommits.has(want)) continue;
-    walk.push({ oid: want, level: 1 });
-    seenCommits.add(want);
+    if (!repo.objects.has(want)) continue;
+    const root = forge.peelToCommit(repo, want) ?? want;
+    if (root !== want) keptTags.add(want);
+    if (!repo.objects.has(root)) continue;
+    if ((depth === null && haveReachable.has(root)) || seenCommits.has(root)) continue;
+    walk.push({ oid: root, level: 1 });
+    seenCommits.add(root);
   }
-  const keep = new Set<string>();
+  const keep = new Set<string>(keptTags);
   const boundary = new Set<string>();
   const unshallowed = new Set<string>();
   while (walk.length > 0) {
@@ -263,7 +285,7 @@ export function selectObjects(
     }
     if (clientShallowSet.has(node.oid)) unshallowed.add(node.oid);
     for (const parent of view.parents) {
-      if (seenCommits.has(parent) || haveReachable.has(parent) || !repo.objects.has(parent)) continue;
+      if (seenCommits.has(parent) || (depth === null && haveReachable.has(parent)) || !repo.objects.has(parent)) continue;
       seenCommits.add(parent);
       walk.push({ oid: parent, level: node.level + 1 });
     }
@@ -287,6 +309,7 @@ export function selectObjects(
   for (const oid of keep) collect(oid);
   const objects: Array<{ oid: string; type: GitObjectType; data: Buffer }> = [];
   const push = (oid: string): void => {
+    if (held.has(oid)) return;
     const object = repo.objects.get(oid);
     if (object === undefined) return;
     objects.push({ oid, type: object.type, data: object.data });
@@ -373,12 +396,12 @@ export function v2Advertisement(): Buffer {
 }
 
 /** The v2 ls-refs response. */
-export function lsRefs(forge: Forge, repo: Repo, args: ReadonlyMap<string, string>): Buffer {
+export function lsRefs(forge: Forge, repo: Repo, args: ReadonlyMap<string, readonly string[]>): Buffer {
   const wantPeel = args.has('peel');
   const wantSymrefs = args.has('symrefs');
   const wantUnborn = args.has('unborn');
   const prefixes: string[] = [];
-  for (const [key, value] of args) if (key === 'ref-prefix') prefixes.push(value);
+  for (const [key, values] of args) if (key === 'ref-prefix') prefixes.push(...values);
   const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   const parts: Buffer[] = [];
   const headOid = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
@@ -440,20 +463,30 @@ export interface ParsedReceiveRequest {
   pack: Uint8Array | null;
 }
 
-/** Parse a receive-pack request body: commands, then flush, then the raw packfile. */
+/** Parse a receive-pack request body: pkt-line commands up to the flush, then the raw packfile. */
 export function parseReceiveRequest(body: Uint8Array): ParsedReceiveRequest {
-  const packets = decodePktLines(body);
+  const view = Buffer.isBuffer(body) ? body : Buffer.from(body.buffer, body.byteOffset, body.byteLength);
   const commands: ReceiveCommand[] = [];
   const capabilities = new Set<string>();
-  let index = 0;
-  for (; index < packets.length; index += 1) {
-    const packet = packets[index] as PktLine;
-    if (packet.kind === 'flush') {
-      index += 1;
+  let offset = 0;
+  let sawFlush = false;
+  while (offset + 4 <= view.length) {
+    const hex = view.subarray(offset, offset + 4).toString('ascii');
+    if (!/^[0-9a-f]{4}$/.test(hex)) throw new Error(`invalid pkt-line length prefix ${JSON.stringify(hex)}`);
+    const length = Number.parseInt(hex, 16);
+    if (length === 0) {
+      offset += 4;
+      sawFlush = true;
       break;
     }
-    if (packet.kind !== 'data') continue;
-    const text = packet.payload.toString('utf8');
+    if (length === 1) {
+      offset += 4;
+      continue;
+    }
+    if (length < 4 || length > MAX_TOTAL) throw new Error(`pkt-line length ${length} is out of range`);
+    if (view.length - offset < length) throw new Error('truncated pkt-line payload');
+    const text = view.subarray(offset + 4, offset + length).toString('utf8');
+    offset += length;
     const nul = text.indexOf('\u0000');
     const head = nul >= 0 ? text.slice(0, nul) : text;
     if (nul >= 0) for (const cap of text.slice(nul + 1).trim().split(' ')) if (cap) capabilities.add(cap);
@@ -461,8 +494,8 @@ export function parseReceiveRequest(body: Uint8Array): ParsedReceiveRequest {
     if (match === null) continue;
     commands.push({ oldOid: match[1] as string, newOid: match[2] as string, ref: match[3] as string });
   }
-  const rest = packets.slice(index).filter((packet) => packet.kind === 'data');
-  const pack = rest.length === 0 ? null : Buffer.concat(rest.map((packet) => packet.payload));
+  if (!sawFlush && commands.length === 0) throw new Error('receive-pack request has no commands and no flush');
+  const pack = view.length > offset ? view.subarray(offset) : null;
   return { commands, capabilities, pack };
 }
 
