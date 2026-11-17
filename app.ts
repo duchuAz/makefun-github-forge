@@ -3,7 +3,9 @@
 // separate from main.ts: this is the server, the file you grow; main.ts is the entry <-> env
 // lifecycle and stays as it is.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
+import { serve, type RawRequest, type RawResponse } from './src/httpserver.ts';
 import { Forge, ApiError, type Repo, type Issue, type Pull, hashObject, parseTree, parseCommit, isObjectId } from './src/store.ts';
 import {
   ZERO_OID, pkt, FLUSH, decodePktLines, cachedV0Advertisement, v2Advertisement, lsRefs, cachedFetchReply,
@@ -58,6 +60,12 @@ function urlOf(req: IncomingMessage): URL {
 
 /** Read the whole body of a request as a Buffer (bounded to keep one bad client from ballooning). */
 function readBody(req: IncomingMessage, limitBytes = 512 * 1024 * 1024): Promise<Buffer> {
+  const buffered = (req as unknown as { rawBody?: Buffer }).rawBody;
+  if (buffered !== undefined) {
+    return buffered.length > limitBytes
+      ? Promise.reject(new ApiError(413, 'the request body is too large'))
+      : Promise.resolve(buffered);
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -79,6 +87,8 @@ const EMPTY_BODY = Buffer.alloc(0);
 
 /** The body of a request: no length and no transfer encoding means there is none to wait for. */
 function bodyFor(req: IncomingMessage): Promise<Buffer> | Buffer {
+  const raw = (req as unknown as { rawBody?: Buffer }).rawBody;
+  if (raw !== undefined) return raw;
   const length = req.headers['content-length'];
   if ((length === undefined || length === '0') && req.headers['transfer-encoding'] === undefined) return EMPTY_BODY;
   return readBody(req);
@@ -609,7 +619,8 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, route: GitRo
     sendJson(res, 404, { message: 'Not Found' });
     return;
   }
-  const body = await bodyFor(req);
+  const pendingGitBody = bodyFor(req);
+  const body = pendingGitBody instanceof Promise ? await pendingGitBody : pendingGitBody;
   const gitProtocol = req.headers['git-protocol'] ?? '';
   const wantsV2 = String(gitProtocol).includes('version=2');
 
@@ -775,8 +786,11 @@ function handleMcp(res: ServerResponse, raw: string, parsed: unknown): void {
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  // The workload is a burst of small keep-alive requests: no per-request timeout bookkeeping.
-  return createServer({ requestTimeout: 0, headersTimeout: 0 }, (req: IncomingMessage, res: ServerResponse) => {
+  // The workload is a burst of small keep-alive requests: a direct socket server, no per-request
+  // timeout bookkeeping and no stream objects between the parser and the handlers.
+  return serve((rawReq: RawRequest, rawRes: RawResponse) => {
+    const req = rawReq as unknown as IncomingMessage;
+    const res = rawRes as unknown as ServerResponse;
     void handleRequest(req, res).catch((err: unknown) => {
       try {
         const status = err instanceof ApiError ? err.status : 500;
@@ -813,7 +827,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       sendJson(res, 401, { message: 'Requires authentication' });
       return;
     }
-    const body = await readBody(req);
+    const maybeBody = bodyFor(req);
+    const body = maybeBody instanceof Promise ? await maybeBody : maybeBody;
     await handleGraphql(res, body);
     return;
   }
@@ -822,7 +837,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       sendJson(res, 401, { message: 'Requires authentication' });
       return;
     }
-    const raw = (await readBody(req)).toString('utf8');
+    const maybePayload = bodyFor(req);
+    const raw = (maybePayload instanceof Promise ? await maybePayload : maybePayload).toString('utf8');
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -835,7 +851,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   // REST: buffer the body once, then dispatch.
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    const body = await bodyFor(req);
+    const pendingBody = bodyFor(req);
+    const body = pendingBody instanceof Promise ? await pendingBody : pendingBody;
     try {
       await handleRest(req, res, method, path, query, body);
     } catch (err) {
