@@ -6,55 +6,53 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Forge, ApiError, type Repo, type Issue, type Pull, hashObject, parseTree, parseCommit, isObjectId } from './src/store.ts';
 import {
-  ZERO_OID, pkt, FLUSH, decodePktLines, v0Advertisement, v2Advertisement, lsRefs, v0Fetch, v2Fetch,
+  ZERO_OID, pkt, FLUSH, decodePktLines, cachedV0Advertisement, v2Advertisement, lsRefs, cachedFetchReply,
   parseReceiveRequest, applyReceiveCommands, receiveReport, advertisedRefs, type PktLine,
 } from './src/gitproto.ts';
 import { graphqlHandler } from './src/graphql.ts';
-import { mcpHandler, repoJson, issueJson, issueJsonText, commentJson, pullJson } from './src/mcp.ts';
+import { mcpHandler, repoJson, issueJson, issueJsonBytes, commentJson, pullJson } from './src/mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 const forge = new Forge();
 let requestIdCounter = 1;
 
+/** Header objects are rare (pagination links, oauth scopes); the hot path stays an array. */
+function headerPairs(headers: Readonly<Record<string, string>>): string[] {
+  const pairs: string[] = [];
+  for (const name in headers) pairs.push(name, headers[name] as string);
+  return pairs;
+}
+
 /** Answer one request with a JSON body; `headers` go beside the JSON ones. */
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': `req-${requestIdCounter++}`,
-    ...headers,
-  });
+  res.writeHead(status, [
+    'content-type', JSON_TYPE,
+    'content-length', String(Buffer.byteLength(text)),
+    'x-github-request-id', `req-${requestIdCounter++}`,
+    ...headerPairs(headers),
+  ]);
   res.end(text);
 }
 
-/** Answer one request with already-serialized JSON text; headers and framing match sendJson. */
-function sendJsonText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
-  const body = `${text}\n`;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(body),
-    'x-github-request-id': `req-${requestIdCounter++}`,
-    ...headers,
-  });
-  res.end(body);
+/** Answer with already-serialized JSON bytes (the cached issue body); framing matches sendJson. */
+function sendJsonBytes(res: ServerResponse, status: number, bytes: Buffer, headers: Readonly<Record<string, string>> = {}): void {
+  res.writeHead(status, [
+    'content-type', JSON_TYPE,
+    'content-length', String(bytes.length),
+    'x-github-request-id', `req-${requestIdCounter++}`,
+    ...headerPairs(headers),
+  ]);
+  res.end(bytes);
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+/** The request URL, parsed once per request; '/' when the target does not parse. */
+function urlOf(req: IncomingMessage): URL {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(req.url ?? '/', 'http://entry');
   } catch {
-    return '/';
-  }
-}
-
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
+    return new URL('/', 'http://entry');
   }
 }
 
@@ -72,9 +70,18 @@ function readBody(req: IncomingMessage, limitBytes = 512 * 1024 * 1024): Promise
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] as Buffer : Buffer.concat(chunks)));
     req.on('error', (err) => reject(err));
   });
+}
+
+const EMPTY_BODY = Buffer.alloc(0);
+
+/** The body of a request: no length and no transfer encoding means there is none to wait for. */
+function bodyFor(req: IncomingMessage): Promise<Buffer> | Buffer {
+  const length = req.headers['content-length'];
+  if ((length === undefined || length === '0') && req.headers['transfer-encoding'] === undefined) return EMPTY_BODY;
+  return readBody(req);
 }
 
 function bearerToken(req: IncomingMessage): string | null {
@@ -317,7 +324,9 @@ function handleRest(req: IncomingMessage, res: ServerResponse, method: string, p
         if (!isObjectId(sha) || !repo.objects.has(sha)) return restError(res, 422, `the object ${sha} does not exist`);
         if (repo.refs.has(ref)) return restError(res, 422, 'reference already exists');
         repo.refs.set(ref, sha);
+        repo.refsGen += 1;
         repo.packCache.clear();
+        repo.replyCache.clear();
         return sendJson(res, 201, refJson(ref, sha));
       }
       if (head === 'git' && segments[1] === 'refs' && method === 'GET' && segments.length >= 4) {
@@ -457,7 +466,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, method: string, p
           const issue = repo.issues.find((candidate) => candidate.number === issueNumber);
           if (segments.length === 2) {
             if (issue === undefined) return restError(res, 404, 'issue not found');
-            if (method === 'GET') return sendJsonText(res, 200, issueJsonText(repo, issue));
+            if (method === 'GET') return sendJsonBytes(res, 200, issueJsonBytes(repo, issue));
             if (method === 'PATCH') {
               const input = parseJsonBody(body);
               if (typeof input.title === 'string' && input.title !== '') issue.title = input.title;
@@ -469,7 +478,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, method: string, p
                 }
               }
               issue.updatedAt = new Date(forge.tick().sec * 1000).toISOString();
-              return sendJson(res, 200, issueJson(repo, issue));
+              return sendJsonBytes(res, 200, issueJsonBytes(repo, issue));
             }
           }
           if (segments[2] === 'comments') {
@@ -590,12 +599,7 @@ function gitRoute(path: string): GitRoute | null {
   };
 }
 
-async function handleGit(req: IncomingMessage, res: ServerResponse, path: string, query: URLSearchParams): Promise<void> {
-  const route = gitRoute(path);
-  if (route === null) {
-    sendJson(res, 404, { message: 'Not Found' });
-    return;
-  }
+async function handleGit(req: IncomingMessage, res: ServerResponse, route: GitRoute, query: URLSearchParams): Promise<void> {
   if (!authorized(req)) {
     sendJson(res, 401, { message: 'Requires authentication' });
     return;
@@ -605,7 +609,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
     sendJson(res, 404, { message: 'Not Found' });
     return;
   }
-  const body = await readBody(req);
+  const body = await bodyFor(req);
   const gitProtocol = req.headers['git-protocol'] ?? '';
   const wantsV2 = String(gitProtocol).includes('version=2');
 
@@ -619,7 +623,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
       }
       const advertisement = service === 'git-upload-pack' && wantsV2
         ? v2Advertisement()
-        : v0Advertisement(forge, repo, service);
+        : cachedV0Advertisement(forge, repo, service);
       res.writeHead(200, {
         'content-type': `application/x-${service}-advertisement`,
         'cache-control': 'no-cache',
@@ -685,7 +689,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
             res.end(reply);
             return;
           }
-          const reply = v2Fetch(forge, repo, wants, haves, depth, shallow);
+          const reply = cachedFetchReply(forge, repo, 'v2', wants, haves, depth, shallow);
           res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache', 'content-length': reply.length });
           res.end(reply);
           return;
@@ -721,7 +725,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
         sendJson(res, 400, { message: 'the fetch has no wants' });
         return;
       }
-      const reply = v0Fetch(forge, repo, wants, haves, depth, shallow);
+      const reply = cachedFetchReply(forge, repo, 'v0', wants, haves, depth, shallow);
       res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache', 'content-length': reply.length });
       res.end(reply);
       return;
@@ -771,7 +775,8 @@ function handleMcp(res: ServerResponse, raw: string, parsed: unknown): void {
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  // The workload is a burst of small keep-alive requests: no per-request timeout bookkeeping.
+  return createServer({ requestTimeout: 0, headersTimeout: 0 }, (req: IncomingMessage, res: ServerResponse) => {
     void handleRequest(req, res).catch((err: unknown) => {
       try {
         const status = err instanceof ApiError ? err.status : 500;
@@ -784,7 +789,9 @@ export function createApp(): Server {
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const path = pathOf(req);
+  const url = urlOf(req);
+  const path = url.pathname;
+  const query = url.searchParams;
   const method = req.method ?? 'GET';
 
   // The env's boot check calls this twice: 200 {"ok":true}.
@@ -796,7 +803,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // git smart HTTP first: /{owner}/{repo}.git[...]
   const git = gitRoute(path);
   if (git !== null) {
-    await handleGit(req, res, path, queryOf(req));
+    await handleGit(req, res, git, query);
     return;
   }
 
@@ -828,9 +835,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   // REST: buffer the body once, then dispatch.
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    const body = await readBody(req);
+    const body = await bodyFor(req);
     try {
-      await handleRest(req, res, method, path, queryOf(req), body);
+      await handleRest(req, res, method, path, query, body);
     } catch (err) {
       const status = err instanceof ApiError ? err.status : 500;
       sendJson(res, status, { message: err instanceof Error ? err.message : String(err) });

@@ -298,6 +298,10 @@ export interface Repo {
   createdAt: string;
   seq: number;
   packCache: Map<string, { pack: Buffer; shallows: string[]; unshallows: string[] }>;
+  /** Fully framed fetch/advertisement replies, keyed by the request they answer. */
+  replyCache: Map<string, Buffer>;
+  /** Bumped on every ref write: packs and advertisements built before it are stale. */
+  refsGen: number;
 }
 
 export class ApiError extends Error {
@@ -458,6 +462,8 @@ export class Forge {
       createdAt: when.iso,
       seq: when.sec,
       packCache: new Map(),
+      replyCache: new Map(),
+      refsGen: 0,
     };
     this.repos.set(key, repo);
     return repo;
@@ -691,7 +697,9 @@ export class Forge {
     });
     const sha = this.putObject(repo, 'commit', data);
     repo.refs.set(`refs/heads/${branch}`, sha);
-    repo.packCache.clear();
+    repo.refsGen += 1;
+    if (repo.packCache.size > 0) repo.packCache.clear();
+    if (repo.replyCache.size > 0) repo.replyCache.clear();
     return sha;
   }
 

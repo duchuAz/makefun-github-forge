@@ -284,7 +284,7 @@ export function repoJson(repo: Repo): Record<string, unknown> {
  * the colours of the issue's labels), so a title/body/state/comment/label change yields a new key and
  * the stale text is never served; nothing has to remember to invalidate the entry explicitly.
  */
-const issueJsonTextCache = new WeakMap<Issue, { key: string; text: string }>();
+const issueJsonTextCache = new WeakMap<Issue, { key: string; text: string; bytes: Buffer }>();
 
 function issueJsonCacheKey(repo: Repo, issue: Issue): string {
   let labels = '';
@@ -294,14 +294,24 @@ function issueJsonCacheKey(repo: Repo, issue: Issue): string {
   return `${repo.id}\u0002${issue.id}\u0002${issue.number}\u0002${issue.title}\u0002${issue.body}\u0002${issue.state}\u0002${issue.comments.length}\u0002${issue.createdAt}\u0002${issue.updatedAt}\u0002${issue.closedAt ?? ''}\u0003${labels}`;
 }
 
-/** The exact JSON text of issueJson(repo, issue), reused while the issue and its labels are unchanged. */
-export function issueJsonText(repo: Repo, issue: Issue): string {
+function cachedIssueJson(repo: Repo, issue: Issue): { key: string; text: string; bytes: Buffer } {
   const key = issueJsonCacheKey(repo, issue);
   const hit = issueJsonTextCache.get(issue);
-  if (hit !== undefined && hit.key === key) return hit.text;
+  if (hit !== undefined && hit.key === key) return hit;
   const text = JSON.stringify(issueJson(repo, issue));
-  issueJsonTextCache.set(issue, { key, text });
-  return text;
+  const entry = { key, text, bytes: Buffer.from(`${text}\n`, 'utf8') };
+  issueJsonTextCache.set(issue, entry);
+  return entry;
+}
+
+/** The exact JSON text of issueJson(repo, issue), reused while the issue and its labels are unchanged. */
+export function issueJsonText(repo: Repo, issue: Issue): string {
+  return cachedIssueJson(repo, issue).text;
+}
+
+/** The exact bytes a REST read of this issue writes (JSON + trailing newline), cached as a Buffer. */
+export function issueJsonBytes(repo: Repo, issue: Issue): Buffer {
+  return cachedIssueJson(repo, issue).bytes;
 }
 
 export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {

@@ -322,7 +322,7 @@ export function selectObjects(
 
 /** Build (and memoize) the pack bytes plus shallow metadata for a fetch. */
 export function buildPack(forge: Forge, repo: Repo, wants: readonly string[], haves: readonly string[], depth: number | null, clientShallow: readonly string[]): { pack: Buffer; shallows: string[]; unshallows: string[] } {
-  const key = [wants.join(','), haves.join(','), depth === null ? '' : String(depth), clientShallow.join(',')].join('|');
+  const key = [String(repo.refsGen), wants.join(','), haves.join(','), depth === null ? '' : String(depth), clientShallow.join(',')].join('|');
   const hit = repo.packCache.get(key);
   if (hit !== undefined) return hit;
   const selection = selectObjects(forge, repo, wants, haves, depth, clientShallow);
@@ -381,18 +381,21 @@ export function v0Advertisement(forge: Forge, repo: Repo, service: 'git-upload-p
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement for upload-pack (constant: built once). */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pkt('# service=git-upload-pack\n'),
+  FLUSH,
+  pkt('version 2\n'),
+  pkt('agent=makefun-forge/1.0\n'),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow\n'),
+  pkt('object-format=sha1\n'),
+  FLUSH,
+]);
+
 /** The v2 capability advertisement for upload-pack. */
 export function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pkt('# service=git-upload-pack\n'),
-    FLUSH,
-    pkt('version 2\n'),
-    pkt('agent=makefun-forge/1.0\n'),
-    pkt('ls-refs=unborn\n'),
-    pkt('fetch=shallow\n'),
-    pkt('object-format=sha1\n'),
-    FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 /** The v2 ls-refs response. */
@@ -449,8 +452,43 @@ export function v0Fetch(forge: Forge, repo: Repo, wants: readonly string[], have
   return Buffer.concat(parts);
 }
 
-// ---------------------------------------------------------------- receive-pack
+/**
+ * The fully framed fetch reply for one request, cached. Two identical requests (the clone workload's
+ * 50 concurrent depth-1 clones, or a client retrying) share one Buffer instead of re-framing the
+ * pack. Content depends only on the requested object ids, depth and boundaries plus the repo's
+ * objects (append-only), so a cache hit can never be stale; ref updates still clear it.
+ */
+export function cachedFetchReply(forge: Forge, repo: Repo, protocol: 'v0' | 'v2', wants: readonly string[], haves: readonly string[], depth: number | null, clientShallow: readonly string[]): Buffer {
+  const key = `${protocol}|${wants.join(',')}|${haves.join(',')}|${depth === null ? '' : depth}|${clientShallow.join(',')}`;
+  const hit = repo.replyCache.get(key);
+  if (hit !== undefined) return hit;
+  const reply = protocol === 'v2'
+    ? v2Fetch(forge, repo, wants, haves, depth, clientShallow)
+    : v0Fetch(forge, repo, wants, haves, depth, clientShallow);
+  if (repo.replyCache.size > 16) repo.replyCache.clear();
+  repo.replyCache.set(key, reply);
+  return reply;
+}
 
+/** The refs a v0 advertisement depends on, as one cheap signature string. */
+function refsSignature(repo: Repo): string {
+  let signature = repo.defaultBranch;
+  for (const [name, oid] of repo.refs) signature += `\u0000${name}\u0001${oid}`;
+  return signature;
+}
+
+/** The v0 advertisement, cached while the repository's refs (the only thing it reads) are unchanged. */
+export function cachedV0Advertisement(forge: Forge, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const key = `adv|${service}|${refsSignature(repo)}`;
+  const hit = repo.replyCache.get(key);
+  if (hit !== undefined) return hit;
+  const reply = v0Advertisement(forge, repo, service);
+  if (repo.replyCache.size > 16) repo.replyCache.clear();
+  repo.replyCache.set(key, reply);
+  return reply;
+}
+
+// ---------------------------------------------------------------- receive-pack
 export interface ReceiveCommand {
   oldOid: string;
   newOid: string;
@@ -527,6 +565,7 @@ export function applyReceiveCommands(forge: Forge, repo: Repo, parsed: ParsedRec
     }
   }
   const report: RefReport[] = [];
+  let refsChanged = false;
   for (const command of parsed.commands) {
     const current = repo.refs.get(command.ref) ?? null;
     if (command.newOid === ZERO_OID) {
@@ -535,6 +574,7 @@ export function applyReceiveCommands(forge: Forge, repo: Repo, parsed: ParsedRec
         continue;
       }
       repo.refs.delete(command.ref);
+      refsChanged = true;
       report.push({ ref: command.ref, ok: true, reason: '' });
       continue;
     }
@@ -548,6 +588,7 @@ export function applyReceiveCommands(forge: Forge, repo: Repo, parsed: ParsedRec
         continue;
       }
       repo.refs.set(command.ref, command.newOid);
+      refsChanged = true;
       report.push({ ref: command.ref, ok: true, reason: '' });
       continue;
     }
@@ -560,14 +601,34 @@ export function applyReceiveCommands(forge: Forge, repo: Repo, parsed: ParsedRec
       continue;
     }
     repo.refs.set(command.ref, command.newOid);
+    refsChanged = true;
     report.push({ ref: command.ref, ok: true, reason: '' });
   }
-  repo.packCache.clear();
+  if (refsChanged) {
+    repo.refsGen += 1;
+    if (repo.packCache.size > 0) repo.packCache.clear();
+    if (repo.replyCache.size > 0) repo.replyCache.clear();
+  }
   return { report, unpackOk };
 }
 
 /** Index a parsed pack into the repo's object store, resolving deltas against earlier entries. */
 function indexPack(forge: Forge, repo: Repo, result: ReadPackResult): void {
+  let hasDelta = false;
+  for (const entry of result.entries) {
+    if (entry.type === 'ofs_delta' || entry.type === 'ref_delta') {
+      hasDelta = true;
+      break;
+    }
+  }
+  // The common push carries only whole objects: index them without building the delta maps.
+  if (!hasDelta) {
+    for (const entry of result.entries) {
+      const oid = hashObject(entry.type as GitObjectType, entry.data);
+      if (!repo.objects.has(oid)) repo.objects.set(oid, { type: entry.type as GitObjectType, data: entry.data });
+    }
+    return;
+  }
   const byOffset = new Map<number, PackEntry>();
   const resolved = new Map<number, string>();
   for (const entry of result.entries) byOffset.set(entry.offset, entry);
