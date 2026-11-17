@@ -279,6 +279,31 @@ export function repoJson(repo: Repo): Record<string, unknown> {
   };
 }
 
+/**
+ * The serialized issue JSON, cached per issue. The cache key is every field issueJson reads (including
+ * the colours of the issue's labels), so a title/body/state/comment/label change yields a new key and
+ * the stale text is never served; nothing has to remember to invalidate the entry explicitly.
+ */
+const issueJsonTextCache = new WeakMap<Issue, { key: string; text: string }>();
+
+function issueJsonCacheKey(repo: Repo, issue: Issue): string {
+  let labels = '';
+  for (const name of issue.labelNames) {
+    labels += `${name}\u0000${repo.labels.get(name)?.color ?? 'ededed'}\u0001`;
+  }
+  return `${repo.id}\u0002${issue.id}\u0002${issue.number}\u0002${issue.title}\u0002${issue.body}\u0002${issue.state}\u0002${issue.comments.length}\u0002${issue.createdAt}\u0002${issue.updatedAt}\u0002${issue.closedAt ?? ''}\u0003${labels}`;
+}
+
+/** The exact JSON text of issueJson(repo, issue), reused while the issue and its labels are unchanged. */
+export function issueJsonText(repo: Repo, issue: Issue): string {
+  const key = issueJsonCacheKey(repo, issue);
+  const hit = issueJsonTextCache.get(issue);
+  if (hit !== undefined && hit.key === key) return hit.text;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issueJsonTextCache.set(issue, { key, text });
+  return text;
+}
+
 export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,

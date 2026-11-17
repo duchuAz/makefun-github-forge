@@ -10,7 +10,7 @@ import {
   parseReceiveRequest, applyReceiveCommands, receiveReport, advertisedRefs, type PktLine,
 } from './src/gitproto.ts';
 import { graphqlHandler } from './src/graphql.ts';
-import { mcpHandler, repoJson, issueJson, commentJson, pullJson } from './src/mcp.ts';
+import { mcpHandler, repoJson, issueJson, issueJsonText, commentJson, pullJson } from './src/mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -27,6 +27,18 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
     ...headers,
   });
   res.end(text);
+}
+
+/** Answer one request with already-serialized JSON text; headers and framing match sendJson. */
+function sendJsonText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
+  const body = `${text}\n`;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(body),
+    'x-github-request-id': `req-${requestIdCounter++}`,
+    ...headers,
+  });
+  res.end(body);
 }
 
 /** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
@@ -445,7 +457,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, method: string, p
           const issue = repo.issues.find((candidate) => candidate.number === issueNumber);
           if (segments.length === 2) {
             if (issue === undefined) return restError(res, 404, 'issue not found');
-            if (method === 'GET') return sendJson(res, 200, issueJson(repo, issue));
+            if (method === 'GET') return sendJsonText(res, 200, issueJsonText(repo, issue));
             if (method === 'PATCH') {
               const input = parseJsonBody(body);
               if (typeof input.title === 'string' && input.title !== '') issue.title = input.title;
