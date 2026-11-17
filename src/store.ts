@@ -530,7 +530,20 @@ export class Forge {
 
   isAncestor(repo: Repo, maybeAncestor: string, descendant: string): boolean {
     if (maybeAncestor === descendant) return true;
-    return this.ancestorCommits(repo, [descendant]).has(maybeAncestor);
+    // Walk only as far as the answer needs: a push almost always names the old tip's own child as
+    // the new tip, so the old tip is the first parent checked, not a 200-commit ancestry set.
+    const seen = new Set<string>();
+    const stack = [descendant];
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (oid === maybeAncestor) return true;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const view = this.commitView(repo, oid);
+      if (view === null) continue;
+      for (const parent of view.parents) stack.push(parent);
+    }
+    return false;
   }
 
   /** The first commit of `b`'s history that is also an ancestor of `a` (their merge base). */
